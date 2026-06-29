@@ -1,0 +1,35 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      address: http://mcp-upstream/anything
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: omni-policy-mcp-tool-drift-via-exchange-v0-1-impl
+        namespace: default
+      config:
+        exchange:
+          orgId: REPLACE_WITH_ORG_ID
+          groupId: REPLACE_WITH_GROUP_ID
+          assetId: REPLACE_WITH_ASSET_ID
+          version: 1.0.0
+          baseUrl: https://anypoint.mulesoft.com
+          authType: oauth2_client_credentials
+          credSecretRef: exchange-creds
+          refreshIntervalSec: 300
+        enforce:
+          exactMatch: true
+          allowAddedTools: false
+          allowRemovedTools: true
+        mode: enforce
+        failOpen:
+          onPinUnavailable: false

@@ -1,0 +1,117 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: MCP Tool Drift Detection (Exchange)
+    description: |
+      Detects tool drift by comparing runtime MCP tools/list responses
+      against canonical descriptors published to Anypoint Exchange.
+      Enforcement modes: strip, warn, or observe. Last-known-good
+      cache survives Exchange outages.
+    category: MCP
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    # ------------------------------------------------------------------
+    # Exchange asset that holds the canonical descriptor set.
+    # ------------------------------------------------------------------
+    exchange:
+      type: object
+      description: |
+        Anypoint Exchange asset reference. The customer's Exchange
+        asset is expected to expose its descriptor set at
+        `assets/{group}/{asset}/{version}/mcp.json`.
+      properties:
+        orgId:
+          type: string
+        groupId:
+          type: string
+        assetId:
+          type: string
+        version:
+          type: string
+          description: |
+            Asset version. Use a pinned semver for deterministic
+            enforcement; `latest` is accepted but emits a
+            `version_changed` event whenever the underlying version
+            changes between refreshes.
+        baseUrl:
+          type: string
+          format: service
+          default: https://anypoint.mulesoft.com
+        authType:
+          type: string
+          enum:
+            - basic
+            - oauth2_client_credentials
+          default: oauth2_client_credentials
+        credSecretRef:
+          type: string
+          description: |
+            Reference to a Flex secrets entry containing the
+            credentials. For `basic`: `username` / `password`. For
+            client_credentials: `clientId` / `clientSecret`.
+        refreshIntervalSec:
+          type: integer
+          minimum: 30
+          maximum: 86400
+          default: 300
+      required:
+        - orgId
+        - groupId
+        - assetId
+        - version
+        - credSecretRef
+
+    # ------------------------------------------------------------------
+    # Enforcement gates against the canonical descriptor set.
+    # ------------------------------------------------------------------
+    enforce:
+      type: object
+      properties:
+        exactMatch:
+          type: boolean
+          default: true
+        allowAddedTools:
+          type: boolean
+          default: false
+        allowRemovedTools:
+          type: boolean
+          default: true
+
+    # ------------------------------------------------------------------
+    # Decision mode.
+    # ------------------------------------------------------------------
+    mode:
+      type: string
+      enum:
+        - enforce
+        - observe
+        - warn
+      default: enforce
+      description: |
+        - enforce: strip drifted tools from `tools/list` responses.
+        - warn: pass through with `x-mcp-drift-warning` header.
+        - observe: emit structured evidence only.
+
+    # ------------------------------------------------------------------
+    # Failure behavior.
+    # ------------------------------------------------------------------
+    failOpen:
+      type: object
+      properties:
+        onPinUnavailable:
+          type: boolean
+          default: false
+          description: |
+            When false (default) `tools/list` is denied if the
+            descriptor set cannot be loaded on bootstrap (no LKG yet).
+            After bootstrap LKG is always preferred over hard failure.
+  required:
+    - exchange
