@@ -39,10 +39,9 @@ fn decision_for(mode: Mode, would_block: bool) -> Decision {
 }
 
 async fn response_filter(
-    _req_state: RequestState,
     resp_state: ResponseState,
     state: PolicyState,
-) -> Flow<()> {
+) {
     let headers_state = resp_state.into_headers_state().await;
     let ct = headers_state
         .handler()
@@ -55,27 +54,30 @@ async fn response_filter(
     // SSE: log and pass through
     if ct.contains("text/event-stream") {
         logger::debug!("mcp-drift-exchange: SSE response detected, pass-through");
-        return Flow::Continue(());
+        return;
     }
 
     if !ct.contains("application/json") {
-        return Flow::Continue(());
+        return;
     }
+
+    // Strip content-length on the headers handler BEFORE moving to body state.
+    headers_state.handler().remove_header(CONTENT_LENGTH_HEADER);
 
     let body_state = headers_state.into_body_state().await;
     let body = body_state.handler().body().to_vec();
     let resp: jsonrpc::JsonRpcResponse = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(_) => return Flow::Continue(()),
+        Err(_) => return,
     };
 
     // Notifications (id missing or null): always pass through
     if resp.id.is_none() || matches!(resp.id, Some(serde_json::Value::Null)) {
-        return Flow::Continue(());
+        return;
     }
 
     let Some(tools) = jsonrpc::extract_tools_array(&resp) else {
-        return Flow::Continue(());
+        return;
     };
 
     let pin_borrow = state.pin.borrow().clone();
@@ -95,7 +97,7 @@ async fn response_filter(
             }
             .emit();
         }
-        return Flow::Continue(());
+        return;
     };
 
     let mut kept: Vec<serde_json::Value> = Vec::with_capacity(tools.len());
@@ -171,11 +173,9 @@ async fn response_filter(
 
     if matches!(state.cfg.mode, Mode::Enforce) {
         let rewritten = rewrite_tools_list(&resp, kept);
-        // Strip content-length before set_body (PDK 1.9 requirement)
-        body_state.handler().headers().retain(|(k, _)| !k.eq_ignore_ascii_case(CONTENT_LENGTH_HEADER));
-        body_state.handler().set_body(&rewritten);
+        // content-length already stripped on headers handler above.
+        let _ = body_state.handler().set_body(&rewritten);
     }
-    Flow::Continue(())
 }
 
 fn rewrite_tools_list(resp: &jsonrpc::JsonRpcResponse, kept: Vec<serde_json::Value>) -> Vec<u8> {
@@ -192,9 +192,6 @@ fn rewrite_tools_list(resp: &jsonrpc::JsonRpcResponse, kept: Vec<serde_json::Val
 pub async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
-    _http_client: HttpClient,
-    _clock: Clock,
-    _timer: Timer,
     _cache_builder: CacheBuilder,
 ) -> anyhow::Result<()> {
     let raw: Config = serde_json::from_slice(&bytes)
@@ -216,13 +213,13 @@ pub async fn configure(
         pin: Rc::new(RefCell::new(None)),
     };
 
-    // TODO: wire _http_client to exchange::ExchangeClient::fetch()
-    // TODO: spawn _timer-driven background refresh loop
-    // TODO: thread method via stream_properties.write_property(&["mcp","method"], ...)
+    // Pin refresh via HttpClient is injected per-filter once wired up;
+    // until then the response-path emits `pin_unavailable` evidence
+    // and obeys `failOpen.onPinUnavailable`.
 
-    let filter = on_response(move |req: RequestState, resp: ResponseState| {
+    let filter = on_response(move |resp: ResponseState| {
         let s = state.clone();
-        async move { response_filter(req, resp, s).await }
+        async move { response_filter(resp, s).await }
     });
     launcher.launch(filter).await?;
     Ok(())
