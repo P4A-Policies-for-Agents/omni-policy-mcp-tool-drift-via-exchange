@@ -9,7 +9,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [package.metadata.anypoint]
-group_id = "f684513f-280e-403a-ac53-80ca62e3de49"
+group_id = "82a0453b-22e6-430d-bbf4-35b989d043dc"
 definition_asset_id = "omni-policy-mcp-tool-drift-via-exchange"
 implementation_asset_id = "omni-policy-mcp-tool-drift-via-exchange-impl"
 

@@ -101,6 +101,49 @@ That is the role of the platform-managed drift-detection variant
 
 ---
 
+## Live Demo
+
+A reference deployment of this policy is running on the
+`agent-network-ingress-gw` Flex Gateway in the Anypoint Sandbox
+environment (org `anypoint-cbp-1780648272`).
+
+| Field | Value |
+|---|---|
+| Gateway | `agent-network-ingress-gw` (id `35755bec-3177-4d32-a8c9-c9705f5b1c0b`, gw `1.13.2`) |
+| Public base URL | `https://agent-network-ingress-gw-zovwbn.jeg62f.usa-e2.cloudhub.io` |
+| Proxy path | `/mcp-drift-via-exchange-demo` |
+| API instance | `20999090` (Exchange asset `drift-demo-a2d-mcp/1.0.0`) |
+| Pin source (Exchange asset) | `82a0453b-22e6-430d-bbf4-35b989d043dc/drift-demo-a2d-mcp/1.0.0` |
+| Upstream (a2d mock) | `https://www.a2d-ai.com/api/platform/7b26e0d0-dfcf-4c6a-8484-8c907724366d/mcp` |
+| Policy version (dev) | `omni-policy-mcp-tool-drift-via-exchange-dev/0.1.0-20260629203732` |
+
+The Exchange asset and the runtime upstream are derived from the same
+A²D MCP server, so a healthy `tools/list` matches the pinned set
+exactly. The contract lives in Exchange; the gateway enforces it.
+
+### Try it
+
+```bash
+curl -sS -X POST \
+  https://agent-network-ingress-gw-zovwbn.jeg62f.usa-e2.cloudhub.io/mcp-drift-via-exchange-demo \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+```
+
+To exercise drift, mutate the upstream A²D mock's tool descriptors
+without re-publishing the Exchange asset. The runtime hash diverges
+from the pinned Exchange hash, the policy strips the drifted tool, and
+the gateway log line carries a `descriptor_drift` JSON record indexed
+by Anypoint Analytics.
+
+Note: the policy config currently uses placeholder secrets
+(`REPLACE_WITH_EXCHANGE_CRED_SECRET_REF`). Swap in real Flex secret
+refs containing the Connected App `clientId`/`clientSecret` for the
+target Anypoint org and re-apply the policy before the Exchange fetch
+will authenticate.
+
+---
+
 ## Build, test, run
 
 ```bash
