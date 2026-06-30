@@ -12,6 +12,58 @@ existing Anypoint analytics pipeline.
 
 ---
 
+## Purpose & business need
+
+### The problem
+
+When an MCP server is exposed to an LLM agent, the `tools/list`
+response is the contract that determines agent behavior. That
+contract is also a moving target:
+
+- A platform team redeploys an MCP server with a "minor" description
+  edit. The agent's behavior changes because the LLM reads
+  descriptions when picking tools.
+- An input schema gains a field. The agent populates it because LLMs
+  trust schemas they see.
+- An output type silently flips from `string` to `object`. Downstream
+  consumers break, but the gateway's metrics still show `200 OK`.
+
+Most organizations don't have any runtime check that the descriptors
+served by an MCP server match the descriptors they actually approved
+and published.
+
+### Why this policy
+
+Anypoint Exchange already is the governance surface for API and MCP
+assets in Mulesoft customers — it owns versioning, approvals, and
+audit trail. This policy makes the Exchange artifact load-bearing at
+runtime:
+
+- **One source of truth** — the descriptor set in the Exchange asset
+  is the contract. The policy hashes each tool descriptor against the
+  pin and reports field-level drift.
+- **Tenant-sovereign** — every fetch, decision, and evidence event
+  stays inside the customer's Anypoint tenant. No external SaaS, no
+  cross-tenant data movement, no SOC2/HIPAA scope creep.
+- **No external request-path dependency** — the pin is fetched on a
+  refresh timer and cached. The hot path is local hash compare;
+  request latency overhead is ~2–5 ms even on 50-tool descriptor
+  sets.
+- **Reuses existing governance** — approving a pin update means
+  bumping the Exchange asset version through the customer's existing
+  approval workflow. No separate truth source to drift out of sync.
+
+### Who needs this
+
+- Anypoint customers who already publish MCP assets to Exchange and
+  want runtime enforcement without an external dependency.
+- Regulated environments (FSI, healthcare, public sector) where every
+  decision must stay inside the tenant.
+- Operators who want a single PR review for "did we approve this
+  descriptor change?" — by reviewing the Exchange asset version bump.
+
+---
+
 ## What it catches
 
 - **Descriptor drift** — runtime descriptor hash ≠ published hash.
@@ -135,6 +187,39 @@ without re-publishing the Exchange asset. The runtime hash diverges
 from the pinned Exchange hash, the policy strips the drifted tool, and
 the gateway log line carries a `descriptor_drift` JSON record indexed
 by Anypoint Analytics.
+
+### Real-world scenario
+
+A healthcare ISV runs an "Accounts" MCP server inside its Anypoint
+tenant for an internal copilot that helps care coordinators schedule
+follow-ups. The current Exchange asset `accounts-mcp/2.4.0` declares
+three tools: `lookup_account`, `search_accounts`, `get_account_balance`.
+Each was reviewed by privacy and approved on the Exchange asset PR.
+
+A new sprint adds a `get_account_history` tool — but a backend
+engineer ships the MCP server change before bumping the Exchange asset
+version. The agent has no idea the new tool exists in the asset
+catalog because it doesn't — only in the running container.
+
+Compliance impact: a tool that returns historical transactions is now
+callable by the LLM, and there's no privacy review on file.
+
+With this policy attached and the Exchange pin at `2.4.0`:
+
+1. The runtime `tools/list` returns four tools; the pin contains
+   three.
+2. `get_account_history` triggers an `unpinned_tool` event.
+3. In `enforce` mode the new tool is stripped before the agent sees
+   it. The copilot continues working with the three approved tools.
+4. The `pin_hash` of each remaining tool matches the runtime hash —
+   no false positives.
+5. The event lands in Anypoint Analytics with `asset_id`,
+   `asset_version`, `tool_name`. The on-call platform engineer pages
+   the backend team to either bump the Exchange asset (with privacy
+   approval) or roll back the deploy.
+
+Throughout this, no data left the tenant. The contract was the
+Exchange asset version that compliance had already approved.
 
 Note: the policy config currently uses placeholder secrets
 (`REPLACE_WITH_EXCHANGE_CRED_SECRET_REF`). Swap in real Flex secret
