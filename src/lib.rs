@@ -17,9 +17,10 @@ use pdk::cache::CacheBuilder;
 use pdk::hl::*;
 use pdk::logger;
 
-use crate::config::{Mode, PolicyConfig};
+use crate::config::{AuthType, Mode, PolicyConfig};
 use crate::debounce::{now_epoch_secs, Debouncer};
 use crate::evidence::{Decision, DetectionClass, Event, Severity};
+use crate::exchange::{ExchangeAuth, ExchangeClient, ExchangeRef as ExchangeAssetRef};
 use crate::generated::config::Config;
 use crate::pin::{classify, PinSet};
 
@@ -30,6 +31,140 @@ struct PolicyState {
     cfg: Rc<PolicyConfig>,
     pin: Rc<RefCell<Option<PinSet>>>,
     debouncer: Rc<RefCell<Debouncer>>,
+}
+
+/// Discover the upstream cluster Envoy selected for the current request
+/// from the stream properties. This is the cluster the API instance
+/// itself proxies to, which the gateway already routes with the correct
+/// `Host`. It is generally populated once routing has picked an upstream
+/// — reliably in the response phase, and often in the request phase too.
+fn cluster_from_props(props: &StreamProperties) -> Option<String> {
+    for path in [&["cluster_name"][..], &["xds", "cluster_name"][..]] {
+        if let Some(bytes) = props.read_property(path) {
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the `Service` used for outbound Exchange calls.
+///
+/// A policy-registered `format: service` upstream is dispatched to a
+/// synthetic Envoy cluster whose egress `:authority` is mangled by the
+/// managed gateway's host-rewrite, so Exchange rejects the call. When a
+/// loopback `exchangePathPrefix` is configured we dispatch to the
+/// configured `baseUrl` (the gateway's own internal listener) verbatim
+/// and skip upstream-cluster discovery; the prefixed path re-enters
+/// through a passthrough route whose `auto_host_rewrite` restores the
+/// correct `Host`. Otherwise we reuse the request's own upstream cluster
+/// (discovered via the `cluster_name` stream property, or the
+/// `x-envoy-decorator-operation` response header as a fallback). If the
+/// cluster can't be discovered, `allow_config_fallback` permits the
+/// legacy `format: service` path as a last resort.
+fn resolve_outbound_service(
+    state: &PolicyState,
+    props: &StreamProperties,
+    decorator: Option<&str>,
+    allow_config_fallback: bool,
+) -> Option<Service> {
+    if !state.cfg.exchange.path_prefix.is_empty() {
+        return state.cfg.exchange.service.clone();
+    }
+    let cluster = cluster_from_props(props).or_else(|| {
+        decorator
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    if let Some(cluster) = cluster {
+        if let Ok(uri) = state.cfg.exchange.base_url.parse::<Uri>() {
+            return Some(Service::new(&cluster, uri));
+        }
+    }
+    if allow_config_fallback {
+        return state.cfg.exchange.service.clone();
+    }
+    None
+}
+
+/// Build the Exchange auth handle from the resolved credential secret.
+///
+/// The credential value is expected to be a colon-joined pair —
+/// `clientId:clientSecret` for `oauth2_client_credentials`, or
+/// `username:password` for `basic`. When no colon is present the whole
+/// value is treated as the first component.
+fn build_exchange_auth(cfg: &crate::config::ExchangeRef) -> ExchangeAuth {
+    let (first, second) = cfg
+        .cred_secret_ref
+        .split_once(':')
+        .unwrap_or((cfg.cred_secret_ref.as_str(), ""));
+    match cfg.auth_type {
+        AuthType::Basic => ExchangeAuth::Basic {
+            username: first.to_string(),
+            password: second.to_string(),
+        },
+        AuthType::OAuth2ClientCredentials => ExchangeAuth::OAuth2 {
+            client_id: first.to_string(),
+            client_secret: second.to_string(),
+        },
+    }
+}
+
+/// Lazy pin fetch. Runs on the first request/response with no pin
+/// loaded, and again after the configured refresh interval has elapsed.
+/// Outbound HTTPS from the request/response phases works under
+/// connected-mode Flex Gateway; the same call from `configure()` never
+/// connects. Last-known-good is preserved on failure.
+async fn ensure_pin_loaded(state: &PolicyState, client: &HttpClient, service: &Service) {
+    let now = now_epoch_secs();
+    let should_refresh = {
+        let borrow = state.pin.borrow();
+        match borrow.as_ref() {
+            None => true,
+            Some(pin) => {
+                let age = now.saturating_sub(pin.fetched_at_epoch_secs);
+                age >= state.cfg.exchange.refresh_interval_secs.max(1) as u64
+            }
+        }
+    };
+    if !should_refresh {
+        return;
+    }
+
+    let reference = ExchangeAssetRef {
+        base_url: state.cfg.exchange.base_url.clone(),
+        org_id: state.cfg.exchange.org_id.clone(),
+        group_id: state.cfg.exchange.group_id.clone(),
+        asset_id: state.cfg.exchange.asset_id.clone(),
+        version: state.cfg.exchange.version.clone(),
+        path_prefix: state.cfg.exchange.path_prefix.clone(),
+        file_path_prefix: state.cfg.exchange.file_path_prefix.clone(),
+    };
+    let auth = build_exchange_auth(&state.cfg.exchange);
+    let exchange = ExchangeClient::new(reference, auth);
+
+    match exchange.fetch(client, service, now).await {
+        Ok(pin) => {
+            let asset_version = pin.asset_version.clone();
+            let tool_count = pin.tools.len();
+            let first_load = state.pin.borrow().is_none();
+            state.pin.replace(Some(pin));
+            logger::info!(
+                "mcp-drift-exchange: pin loaded (first_load={} asset_version={} tools={})",
+                first_load,
+                asset_version,
+                tool_count
+            );
+        }
+        Err(e) => {
+            logger::warn!("mcp-drift-exchange: pin fetch failed: {e}");
+        }
+    }
 }
 
 fn emit_debounced(event: Event<'_>, state: &PolicyState, now_secs: u64) {
@@ -54,23 +189,55 @@ fn decision_for(mode: Mode, would_block: bool) -> Decision {
     }
 }
 
-async fn response_filter(
-    resp_state: ResponseState,
+/// Request-phase handler. We do not inspect the request body; we run
+/// here only to warm the pin cache with an outbound HTTPS call when the
+/// upstream cluster is already known. Outbound HTTPS is safe in the
+/// request-headers phase (before the body-state transition). We do NOT
+/// fall back to the config `format: service` cluster here because its
+/// egress `Host` is mangled by the managed gateway; that fallback is
+/// only allowed (via loopback or last-resort) in the response phase.
+async fn request_filter(
+    _request: RequestHeadersState,
     state: PolicyState,
+    client: HttpClient,
+    props: StreamProperties,
+) -> Flow<()> {
+    if let Some(service) = resolve_outbound_service(&state, &props, None, false) {
+        ensure_pin_loaded(&state, &client, &service).await;
+    }
+    Flow::Continue(())
+}
+
+async fn response_filter(
+    headers_state: ResponseHeadersState,
+    state: PolicyState,
+    client: HttpClient,
+    _data: RequestData<()>,
+    props: StreamProperties,
 ) {
-    let headers_state = resp_state.into_headers_state().await;
-    let ct = headers_state
-        .handler()
-        .headers()
-        .into_iter()
+    let headers = headers_state.handler().headers();
+    let ct = headers
+        .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v)
+        .map(|(_, v)| v.clone())
         .unwrap_or_default();
 
     let is_sse = ct.contains("text/event-stream");
     let is_json = ct.contains("application/json");
     if !is_sse && !is_json {
         return;
+    }
+
+    // Second-chance pin load. The response phase is a safe outbound
+    // context AND the phase where the upstream cluster is reliably known,
+    // so resolve the outbound service to the request's own upstream
+    // cluster (with `x-envoy-decorator-operation` as a fallback source).
+    let decorator = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-envoy-decorator-operation"))
+        .map(|(_, v)| v.clone());
+    if let Some(service) = resolve_outbound_service(&state, &props, decorator.as_deref(), true) {
+        ensure_pin_loaded(&state, &client, &service).await;
     }
 
     // Strip content-length on the headers handler BEFORE moving to body state.
@@ -270,12 +437,16 @@ pub async fn configure(
         .map_err(|e| anyhow!("policy configuration rejected: {e}"))?;
 
     logger::info!(
-        "mcp-drift-exchange: loaded asset={}/{}/{} base={} mode={:?}",
+        "mcp-drift-exchange: loaded asset={}/{}/{} base={} mode={:?} authType={:?} refresh={}s loopback={} service_bound={}",
         cfg.exchange.group_id,
         cfg.exchange.asset_id,
         cfg.exchange.version,
         cfg.exchange.base_url,
         cfg.mode,
+        cfg.exchange.auth_type,
+        cfg.exchange.refresh_interval_secs,
+        !cfg.exchange.path_prefix.is_empty(),
+        cfg.exchange.service.is_some(),
     );
 
     let state = PolicyState {
@@ -284,14 +455,30 @@ pub async fn configure(
         debouncer: Rc::new(RefCell::new(Debouncer::default())),
     };
 
-    // Pin refresh via HttpClient is injected per-filter once wired up;
-    // until then the response-path emits `pin_unavailable` evidence
-    // and obeys `failOpen.onPinUnavailable`.
+    if state.cfg.exchange.service.is_none() {
+        logger::warn!(
+            "mcp-drift-exchange: baseUrl service unbound; response path will emit pin_unavailable evidence and obey failOpen.onPinUnavailable"
+        );
+    }
 
-    let filter = on_response(move |resp: ResponseState| {
-        let s = state.clone();
-        async move { response_filter(resp, s).await }
-    });
+    let request_state = state.clone();
+    let response_state = state;
+    let filter = on_request(
+        move |request: RequestHeadersState, client: HttpClient, props: StreamProperties| {
+            let s = request_state.clone();
+            async move { request_filter(request, s, client, props).await }
+        },
+    )
+    .on_response(
+        move |response: ResponseHeadersState,
+              client: HttpClient,
+              data: RequestData<()>,
+              props: StreamProperties| {
+            let s = response_state.clone();
+            async move { response_filter(response, s, client, data, props).await }
+        },
+    );
+
     launcher.launch(filter).await?;
     Ok(())
 }

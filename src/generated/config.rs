@@ -22,6 +22,10 @@ pub struct ExchangeConfig {
     pub base_url: Option<pdk::hl::Service>,
     #[serde(alias = "credSecretRef")]
     pub cred_secret_ref: String,
+    #[serde(alias = "exchangeFilePathPrefix")]
+    pub exchange_file_path_prefix: Option<String>,
+    #[serde(alias = "exchangePathPrefix")]
+    pub exchange_path_prefix: Option<String>,
     #[serde(alias = "groupId")]
     pub group_id: String,
     #[serde(alias = "orgId")]

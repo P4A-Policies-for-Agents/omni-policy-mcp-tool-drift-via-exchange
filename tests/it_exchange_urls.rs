@@ -13,6 +13,7 @@ fn make_ref(base: &str) -> ExchangeRef {
         group_id: "g".into(),
         asset_id: "a".into(),
         version: "1.0.0".into(),
+        path_prefix: String::new(),
     }
 }
 

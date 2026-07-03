@@ -1,25 +1,34 @@
 # Roadmap — MCP Tool Drift Detection (Exchange)
 
-## Now (v0.1)
+## Now (v0.1) — shipped
 
 - GCL schema for Exchange asset + enforcement + mode.
 - Canonical-hash diff with field-level classification
   (description/inputSchema/outputSchema/annotations).
-- Response-filter entrypoint that emits evidence and (in `enforce`)
-  strips drifted tools from `tools/list`.
-- `ExchangeRef` URL construction for descriptor + OAuth2 token
-  endpoints.
-- Five integration test files (drift classification, pin
-  construction, Exchange URLs, config loading, passthrough).
+- Dual-phase filter (`on_request` + `on_response`) that lazily loads
+  the pin, emits evidence, and (in `enforce`) strips drifted tools from
+  `tools/list` on both `application/json` and `text/event-stream`
+  transports.
+- **Live Exchange fetch wired** — real PDK `HttpClient` + `Service`
+  outbound: OAuth2 client-credentials token mint (or Basic header),
+  descriptor GET, parse into `PinSet`. LKG retained on failure.
+- **`baseUrl` as `format: service`** — registered as an Envoy upstream
+  cluster; `Option<pdk::hl::Service>` bound in typed config.
+- **`exchangePathPrefix` loopback mode** — managed-gateway egress-`Host`
+  workaround (dispatch to `baseUrl` verbatim through a loopback route).
+- `ExchangeRef` URL/path construction for descriptor + OAuth2 token
+  endpoints (prefix-aware).
+- Five integration test files + expanded `exchange` unit tests
+  (token parse, descriptor parse shapes, path-prefix, credentials).
 
 ## Short-term (v0.2)
 
-- **HttpClient wiring** — OAuth2 client_credentials token mint, GET
-  the descriptor URL with the bearer, parse into `PinSet`.
-- **Timer-driven refresh** — refresh at `refreshIntervalSec`; on
-  failure retain LKG and emit `pin_stale`.
+- **Cross-replica pin cache** — memoize the pin in the PDK `Cache`
+  (from `CacheBuilder`) so warm replicas skip the cold fetch.
 - **`version=latest` resolution** — fetch the resolved version per
   refresh; emit `version_changed` on transition.
+- **`pin_stale` evidence** — fire on every failed refresh once an LKG
+  pin exists.
 - **`x-mcp-drift-warning` header** for `warn` mode.
 
 ## Medium-term (v0.3)

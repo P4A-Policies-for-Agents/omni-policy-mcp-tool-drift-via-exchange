@@ -24,9 +24,11 @@ spec:
     exchange:
       type: object
       description: |
-        Anypoint Exchange asset reference. The customer's Exchange
-        asset is expected to expose its descriptor set at
-        `assets/{group}/{asset}/{version}/mcp.json`.
+        Anypoint Exchange asset reference. The descriptor set is fetched
+        in two hops: (1) GET the asset metadata at
+        `exchange/api/v2/assets/{group}/{asset}/{version}`, then (2) GET
+        the JSON descriptor file from the pre-signed `externalLink`
+        returned in that metadata's `files` array.
       properties:
         orgId:
           type: string
@@ -45,6 +47,44 @@ spec:
           type: string
           format: service
           default: https://anypoint.mulesoft.com
+          description: |
+            Anypoint Exchange base URL. Registered as a `format: service`
+            Envoy upstream cluster, so it MUST be host-only (no path
+            component). Defaults to the control-plane
+            (`https://anypoint.mulesoft.com`); override for EU
+            (`https://eu1.anypoint.mulesoft.com`) / GovCloud, or point at
+            the gateway's own internal listener when using
+            `exchangePathPrefix` (loopback mode).
+        exchangePathPrefix:
+          type: string
+          default: ""
+          description: |
+            Optional path prefix prepended to every Exchange request path
+            (e.g. `/exchange-pin`). When set, the policy dispatches the
+            pin fetch to `baseUrl` verbatim (no upstream-cluster
+            discovery), so `baseUrl` can point at the gateway's own
+            internal listener (`http://127.0.0.1:8081`) and the request
+            re-enters through a plain passthrough route whose
+            `auto_host_rewrite` restores the correct `Host` for
+            `anypoint.mulesoft.com`. This works around managed Omni /
+            Flex Gateways mangling the egress `Host` on
+            policy-originated calls. Leave empty for a direct Exchange
+            call.
+        exchangeFilePathPrefix:
+          type: string
+          default: ""
+          description: |
+            Path prefix for the SECOND loopback hop that fetches the
+            descriptor FILE content from the pre-signed storage URL
+            (e.g. `/exchange-s3`). Exchange returns asset metadata from
+            anypoint.mulesoft.com but serves the file itself from a
+            pre-signed S3 URL on a different host; that host enforces the
+            signed `Host`, so on a managed gateway the file GET must go
+            through its own passthrough route whose auto_host_rewrite
+            restores the S3 Host. Both hops share `baseUrl`
+            (http://127.0.0.1:8081); this prefix selects the S3 route.
+            Leave empty only on a connected gateway that can reach the
+            storage host directly.
         authType:
           type: string
           enum:

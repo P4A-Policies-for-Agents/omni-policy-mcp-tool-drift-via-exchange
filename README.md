@@ -45,10 +45,11 @@ runtime:
 - **Tenant-sovereign** — every fetch, decision, and evidence event
   stays inside the customer's Anypoint tenant. No external SaaS, no
   cross-tenant data movement, no SOC2/HIPAA scope creep.
-- **No external request-path dependency** — the pin is fetched on a
-  refresh timer and cached. The hot path is local hash compare;
-  request latency overhead is ~2–5 ms even on 50-tool descriptor
-  sets.
+- **No external SaaS dependency** — the pin is fetched from Anypoint
+  Exchange lazily on the request/response path, cached in-process, and
+  refreshed after `refreshIntervalSec`. The hot path is a local hash
+  compare; request latency overhead is ~2–5 ms even on 50-tool
+  descriptor sets.
 - **Reuses existing governance** — approving a pin update means
   bumping the Exchange asset version through the customer's existing
   approval workflow. No separate truth source to drift out of sync.
@@ -93,10 +94,12 @@ runtime:
 | `exchange.groupId` | string | required | Exchange group id. |
 | `exchange.assetId` | string | required | Exchange asset id. |
 | `exchange.version` | string | required | Pinned semver or `latest`. |
-| `exchange.baseUrl` | string | `https://anypoint.mulesoft.com` | Override for sovereign / EU. |
+| `exchange.baseUrl` | string (`format: service`) | `https://anypoint.mulesoft.com` | Registered as an Envoy upstream cluster — host-only, no path. Override for EU (`https://eu1.anypoint.mulesoft.com`) / GovCloud, or point at the gateway loopback listener when using `exchangePathPrefix`. |
+| `exchange.exchangePathPrefix` | string | `""` | Loopback path prefix for **HOP 1** (metadata + token), e.g. `/exchange-pin`. When set, the pin fetch is dispatched to `baseUrl` verbatim and prefixed onto every Exchange request path — the managed-gateway egress-`Host` workaround (see below). Empty = direct call to `anypoint.mulesoft.com`. |
+| `exchange.exchangeFilePathPrefix` | string | `""` | Loopback path prefix for **HOP 2** (the pre-signed storage/S3 descriptor file), e.g. `/exchange-s3`. The descriptor file is served from a `Host`-strict S3 URL, so on a managed gateway the file GET is re-issued to `baseUrl` under this prefix (no `Authorization`) and the passthrough route's `auto_host_rewrite` restores the S3 `Host`. Shares `baseUrl` with hop 1. Leave empty only on a connected gateway that can reach the storage host directly. |
 | `exchange.authType` | enum | `oauth2_client_credentials` | or `basic`. |
-| `exchange.credSecretRef` | string | required | Flex secret holding the credentials. |
-| `exchange.refreshIntervalSec` | int 30–86400 | 300 | Refresh cadence. |
+| `exchange.credSecretRef` | string | required | Flex secret holding the credentials. Resolved value is a colon-joined pair: `clientId:clientSecret` (OAuth2) or `username:password` (basic). |
+| `exchange.refreshIntervalSec` | int 30–86400 | 300 | Refresh cadence (lazy, request-path driven). |
 | `enforce.exactMatch` | bool | `true` | Strict hash equality. |
 | `enforce.allowAddedTools` | bool | `false` | Unpinned tools blocked by default. |
 | `enforce.allowRemovedTools` | bool | `true` | Deprecation allowed. |
@@ -144,6 +147,132 @@ The policy handles both MCP Streamable HTTP transports:
 
 `content-length` is stripped on the response headers before the body
 handler mutates the payload.
+
+---
+
+## Authentication
+
+The Exchange fetch authenticates with one of two schemes, selected by
+`exchange.authType`:
+
+- **`oauth2_client_credentials`** (default) — the policy POSTs
+  `grant_type=client_credentials` to
+  `{baseUrl}{exchangePathPrefix}/accounts/api/v2/oauth2/token`
+  (Connected App), sending the client id/secret both in the form body and
+  as an HTTP Basic header, then uses the returned `access_token` as
+  `Authorization: Bearer <token>` on the metadata GET.
+- **`basic`** — the policy builds `Authorization: Basic base64(user:pass)`
+  directly for the metadata GET (no token round-trip).
+
+`exchange.credSecretRef` points at a Flex Secrets entry whose resolved
+value is a **colon-joined pair**: `clientId:clientSecret` for OAuth2, or
+`username:password` for basic. If the value contains no colon, the whole
+string is treated as the first component (id/username) and the second is
+empty.
+
+### The two-hop descriptor fetch
+
+The descriptor is **not** fetched from a single fixed file path. Anypoint Exchange
+serves asset metadata from the control plane but serves the asset's files
+from a pre-signed storage (S3) URL on a different `Host`-strict host, so
+the fetch is two hops (both dispatched through the same `baseUrl`):
+
+1. **HOP 1 — metadata.**
+   `GET {baseUrl}{exchangePathPrefix}/exchange/api/v2/assets/{groupId}/{assetId}/{version}`
+   with the bearer/basic `Authorization`. The response's `files` array
+   lists each file's `classifier`, `packaging`, and a pre-signed
+   `externalLink` (an S3 URL). The policy selects the first file with
+   `packaging == "json"` and classifier in
+   `[mcp-metadata, custom, fat-mcp-metadata]` (else the first
+   `packaging == "json"` file) and takes its `externalLink`.
+2. **HOP 2 — file.** The `externalLink` is a pre-signed S3 URL whose
+   signature binds the `Host`. The policy strips the scheme + authority
+   and re-issues
+   `GET {baseUrl}{exchangeFilePathPrefix}{s3_path}?{s3_query}` with **no**
+   `Authorization` header; the `/exchange-s3` route's `auto_host_rewrite`
+   restores the real S3 `Host` so the pre-signed signature validates.
+
+The returned JSON is parsed into the pinned tool set, accepting
+`{tools:[…]}`, `{version,tools}`, `{payload:{tools}}`, or
+`{mcp:{tools}}`.
+
+---
+
+## Managed gateway deployment (egress-`Host` workaround)
+
+On managed Anypoint Omni / Flex Gateways, policy-originated (WASM)
+outbound calls are dispatched straight to an Envoy cluster and do **not**
+traverse the route-level `auto_host_rewrite` that the main proxy relies
+on. The gateway rewrites the egress `:authority`/`Host` to an internal
+cluster identifier, so a direct call to `anypoint.mulesoft.com` is
+rejected (the control plane routes strictly by `Host`). This is the same
+class of failure documented at length in `DEPLOYMENT-NOTES.md` for the
+sibling A²D policy.
+
+Because the pin fetch is **two hops** to two different `Host`-strict
+hosts (`anypoint.mulesoft.com` for metadata + token, and the pre-signed
+S3 host for the file), the workaround is **two gateway loopback routes**
+plus `exchangePathPrefix` / `exchangeFilePathPrefix`:
+
+| Loopback path | Upstream | Hop |
+|---|---|---|
+| `/exchange-pin` | `https://anypoint.mulesoft.com` | Hop 1: metadata + OAuth2 token |
+| `/exchange-s3`  | `https://exchange2-asset-manager-kprod.s3.amazonaws.com` | Hop 2: pre-signed descriptor file |
+
+1. Create two plain HTTP passthrough API instances (no policy) on the
+   **same ingress gateway**, both listening on the internal
+   `http://127.0.0.1:8081`. Flex strips the base path and each route's
+   `auto_host_rewrite` restores the correct `Host` for its upstream.
+2. Configure this policy with:
+
+   ```json
+   {
+     "exchange": {
+       "baseUrl": "http://127.0.0.1:8081",
+       "exchangePathPrefix": "/exchange-pin",
+       "exchangeFilePathPrefix": "/exchange-s3",
+       "orgId": "…", "groupId": "…", "assetId": "…", "version": "1.0.0",
+       "authType": "oauth2_client_credentials",
+       "credSecretRef": "exchange-creds"
+     }
+   }
+   ```
+
+When the prefixes are set the policy skips upstream-cluster discovery and
+dispatches both hops to `baseUrl` (the loopback listener) directly. The
+`wasm → 127.0.0.1:8081` call hits Envoy directly (bypassing the
+`Host`-mangling load balancer), and each loopback route launders the
+`Host` back to its real upstream.
+
+> The loopbacks **must be same-pod on the ingress gateway.** An earlier
+> attempt to host them on the egress gateway failed — cross-gateway calls
+> to the egress internal URL still get their `Host` mangled at the
+> internal load balancer. Since these routes are publicly reachable,
+> harden them with a restrictive policy. See
+> [`docs/managed-omni-gateway-setup.md`](docs/managed-omni-gateway-setup.md)
+> for the full recipe.
+
+On self-managed / connected Flex Gateways that honor `auto_host_rewrite`
+on user clusters and can reach both hosts directly, leave both
+`exchangePathPrefix` and `exchangeFilePathPrefix` empty for a direct
+call.
+
+### Build trap — always unset `CARGO_TARGET_DIR`
+
+If `CARGO_TARGET_DIR` is overridden (e.g. by a sandbox cache), `cargo
+build` writes the fresh wasm elsewhere while `make publish` reads the
+stale `./target/.../*.wasm`, so you silently ship an old binary. Always
+prefix build/publish commands:
+
+```bash
+env -u CARGO_TARGET_DIR make build
+env -u CARGO_TARGET_DIR make publish
+# verify the binary you're about to ship contains the new two-hop code:
+LC_ALL=C grep -a -c "exchangeFilePathPrefix" \
+  target/wasm32-wasip1/release/omni_policy_mcp_tool_drift_via_exchange.wasm  # 0 == stale
+LC_ALL=C grep -a -c "exchangePathPrefix" \
+  target/wasm32-wasip1/release/omni_policy_mcp_tool_drift_via_exchange.wasm  # 0 == stale
+```
 
 ---
 
@@ -252,15 +381,20 @@ will authenticate.
 
 ```bash
 make setup
-make build
-make test
+env -u CARGO_TARGET_DIR make build
+env -u CARGO_TARGET_DIR cargo test --lib
 make run
-make publish
-make release
+env -u CARGO_TARGET_DIR make publish
+env -u CARGO_TARGET_DIR make release
 ```
 
 `make build` runs `cargo anypoint config-gen` against
-`definition/gcl.yaml`, which overwrites `src/generated/config.rs`.
+`definition/gcl.yaml`, which overwrites `src/generated/config.rs`, then
+compiles the wasm and generates the definition/implementation YAML.
+
+Always prefix cargo/make with `env -u CARGO_TARGET_DIR` (see the build
+trap above). Unit tests are the source of truth; run them with
+`cargo test --lib`.
 
 ---
 

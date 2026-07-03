@@ -56,6 +56,22 @@ pub struct ExchangeRef {
     pub auth_type: AuthType,
     pub cred_secret_ref: String,
     pub refresh_interval_secs: u32,
+    /// Optional path prefix prepended to every Exchange request path
+    /// (e.g. `/exchange-pin`). When non-empty the policy runs in
+    /// "loopback" mode: it dispatches the pin fetch to `service`
+    /// (`baseUrl`) verbatim instead of discovering the request's own
+    /// upstream cluster. See `gcl.yaml` `exchangePathPrefix`.
+    pub path_prefix: String,
+    /// Optional path prefix for the SECOND loopback hop that fetches the
+    /// descriptor FILE content from the pre-signed storage URL (e.g.
+    /// `/exchange-s3`). Selects a passthrough route whose
+    /// `auto_host_rewrite` restores the S3 Host. See `gcl.yaml`
+    /// `exchangeFilePathPrefix`.
+    pub file_path_prefix: String,
+    /// Cargo-anypoint codegen registers this handle at boot via
+    /// `abi.service_create`; it is the required argument to
+    /// `HttpClient::request(&service)` at runtime.
+    pub service: Option<pdk::hl::Service>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +133,21 @@ fn parse_exchange(
             .refresh_interval_sec
             .unwrap_or(300)
             .clamp(30, 86_400) as u32,
+        path_prefix: e
+            .exchange_path_prefix
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/')
+            .to_string(),
+        file_path_prefix: e
+            .exchange_file_path_prefix
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/')
+            .to_string(),
+        service: e.base_url.clone(),
     })
 }
 
