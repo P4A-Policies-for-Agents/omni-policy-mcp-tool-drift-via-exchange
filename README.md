@@ -126,6 +126,25 @@ Every decision lands as a JSON log line through the PDK logger.
 `class` ∈ `descriptor_drift | unpinned_tool | removed_tool |
 version_changed | pin_stale | pin_unavailable`.
 
+Evidence emission is debounced per-instance: at most one row per
+`(tool_name, detection_class)` per 60 s window, bounded by a
+1024-entry LRU. Enforcement decisions are NOT gated — a sustained drift
+storm still triggers per-request stripping, but only one evidence row
+surfaces per window.
+
+---
+
+## Transport
+
+The policy handles both MCP Streamable HTTP transports:
+
+- **`application/json`** — plain JSON-RPC envelope in the response body.
+- **`text/event-stream`** — one or more SSE frames whose `data:` line
+  is a JSON-RPC envelope. Un-mutated frames round-trip byte-perfectly.
+
+`content-length` is stripped on the response headers before the body
+handler mutates the payload.
+
 ---
 
 ## Failure modes

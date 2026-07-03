@@ -1,11 +1,13 @@
 //! MCP Tool Drift Detection (Exchange) — policy entrypoint.
 
 pub mod config;
+pub mod debounce;
 pub mod evidence;
 pub mod exchange;
 pub mod generated;
 pub mod jsonrpc;
 pub mod pin;
+pub mod sse;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,6 +18,7 @@ use pdk::hl::*;
 use pdk::logger;
 
 use crate::config::{Mode, PolicyConfig};
+use crate::debounce::{now_epoch_secs, Debouncer};
 use crate::evidence::{Decision, DetectionClass, Event, Severity};
 use crate::generated::config::Config;
 use crate::pin::{classify, PinSet};
@@ -26,6 +29,19 @@ const CONTENT_LENGTH_HEADER: &str = "content-length";
 struct PolicyState {
     cfg: Rc<PolicyConfig>,
     pin: Rc<RefCell<Option<PinSet>>>,
+    debouncer: Rc<RefCell<Debouncer>>,
+}
+
+fn emit_debounced(event: Event<'_>, state: &PolicyState, now_secs: u64) {
+    let tool_key = event.tool_name.unwrap_or("<policy>");
+    let class_label = event.class.debounce_label();
+    if state
+        .debouncer
+        .borrow_mut()
+        .should_emit(tool_key, class_label, now_secs)
+    {
+        event.emit();
+    }
 }
 
 fn decision_for(mode: Mode, would_block: bool) -> Decision {
@@ -51,13 +67,9 @@ async fn response_filter(
         .map(|(_, v)| v)
         .unwrap_or_default();
 
-    // SSE: log and pass through
-    if ct.contains("text/event-stream") {
-        logger::debug!("mcp-drift-exchange: SSE response detected, pass-through");
-        return;
-    }
-
-    if !ct.contains("application/json") {
+    let is_sse = ct.contains("text/event-stream");
+    let is_json = ct.contains("application/json");
+    if !is_sse && !is_json {
         return;
     }
 
@@ -66,41 +78,85 @@ async fn response_filter(
 
     let body_state = headers_state.into_body_state().await;
     let body = body_state.handler().body().to_vec();
-    let resp: jsonrpc::JsonRpcResponse = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => return,
+
+    let rewritten: Option<Vec<u8>> = if is_sse {
+        enforce_sse(&body, &state)
+    } else {
+        enforce_json(&body, &state)
     };
 
-    // Notifications (id missing or null): always pass through
+    if let Some(new_body) = rewritten {
+        let _ = body_state.handler().set_body(&new_body);
+    }
+}
+
+fn enforce_sse(body: &[u8], state: &PolicyState) -> Option<Vec<u8>> {
+    let mut events = sse::parse(body);
+    let mut mutated = false;
+    for ev in events.iter_mut() {
+        let Some(data) = ev.data.as_deref() else {
+            continue;
+        };
+        let Ok(resp) = serde_json::from_str::<jsonrpc::JsonRpcResponse>(data) else {
+            continue;
+        };
+        if let Some(new_resp) = apply_policy(&resp, state) {
+            let Ok(new_data) = serde_json::to_string(&new_resp) else {
+                continue;
+            };
+            ev.data = Some(new_data);
+            mutated = true;
+        }
+    }
+    if !mutated {
+        return None;
+    }
+    Some(sse::serialize(&events))
+}
+
+fn enforce_json(body: &[u8], state: &PolicyState) -> Option<Vec<u8>> {
+    let resp: jsonrpc::JsonRpcResponse = serde_json::from_slice(body).ok()?;
+    let new_resp = apply_policy(&resp, state)?;
+    serde_json::to_vec(&new_resp).ok()
+}
+
+fn apply_policy(
+    resp: &jsonrpc::JsonRpcResponse,
+    state: &PolicyState,
+) -> Option<jsonrpc::JsonRpcResponse> {
     if resp.id.is_none() || matches!(resp.id, Some(serde_json::Value::Null)) {
-        return;
+        return None;
     }
 
-    let Some(tools) = jsonrpc::extract_tools_array(&resp) else {
-        return;
-    };
+    let tools = jsonrpc::extract_tools_array(resp)?;
+
+    let now_secs = now_epoch_secs();
 
     let pin_borrow = state.pin.borrow().clone();
     let Some(pin) = pin_borrow else {
         if !state.cfg.fail_open_on_pin_unavailable {
-            Event {
-                class: DetectionClass::PinUnavailable,
-                severity: Severity::Critical,
-                decision: Decision::Blocked,
-                asset_id: &state.cfg.exchange.asset_id,
-                asset_version: Some(&state.cfg.exchange.version),
-                tool_name: None,
-                pin_hash: None,
-                runtime_hash: None,
-                field: None,
-                note: Some("no pin loaded; failing closed"),
-            }
-            .emit();
+            emit_debounced(
+                Event {
+                    class: DetectionClass::PinUnavailable,
+                    severity: Severity::Critical,
+                    decision: Decision::Blocked,
+                    asset_id: &state.cfg.exchange.asset_id,
+                    asset_version: Some(&state.cfg.exchange.version),
+                    tool_name: None,
+                    pin_hash: None,
+                    runtime_hash: None,
+                    field: None,
+                    note: Some("no pin loaded; failing closed"),
+                },
+                state,
+                now_secs,
+            );
         }
-        return;
+        return None;
     };
 
     let mut kept: Vec<serde_json::Value> = Vec::with_capacity(tools.len());
+    let mut stripped_any = false;
     for tool in tools.iter() {
         let Some(name) = tool.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -110,42 +166,50 @@ async fn response_filter(
             if state.cfg.enforce.exact_match {
                 if let Some(field) = classify(pinned, tool) {
                     let runtime_hash = pin::canonical_hash(tool);
-                    Event {
-                        class: DetectionClass::DescriptorDrift,
-                        severity: Severity::Critical,
-                        decision: decision_for(state.cfg.mode, true),
-                        asset_id: &state.cfg.exchange.asset_id,
-                        asset_version: Some(&pin.asset_version),
-                        tool_name: Some(name),
-                        pin_hash: Some(&pinned.hash),
-                        runtime_hash: Some(&runtime_hash),
-                        field: Some(field.label()),
-                        note: None,
-                    }
-                    .emit();
+                    emit_debounced(
+                        Event {
+                            class: DetectionClass::DescriptorDrift,
+                            severity: Severity::Critical,
+                            decision: decision_for(state.cfg.mode, true),
+                            asset_id: &state.cfg.exchange.asset_id,
+                            asset_version: Some(&pin.asset_version),
+                            tool_name: Some(name),
+                            pin_hash: Some(&pinned.hash),
+                            runtime_hash: Some(&runtime_hash),
+                            field: Some(field.label()),
+                            note: None,
+                        },
+                        state,
+                        now_secs,
+                    );
                     keep = !matches!(state.cfg.mode, Mode::Enforce);
                 }
             }
         } else {
-            Event {
-                class: DetectionClass::UnpinnedTool,
-                severity: Severity::Warning,
-                decision: decision_for(state.cfg.mode, !state.cfg.enforce.allow_added_tools),
-                asset_id: &state.cfg.exchange.asset_id,
-                asset_version: Some(&pin.asset_version),
-                tool_name: Some(name),
-                pin_hash: None,
-                runtime_hash: None,
-                field: None,
-                note: None,
-            }
-            .emit();
+            emit_debounced(
+                Event {
+                    class: DetectionClass::UnpinnedTool,
+                    severity: Severity::Warning,
+                    decision: decision_for(state.cfg.mode, !state.cfg.enforce.allow_added_tools),
+                    asset_id: &state.cfg.exchange.asset_id,
+                    asset_version: Some(&pin.asset_version),
+                    tool_name: Some(name),
+                    pin_hash: None,
+                    runtime_hash: None,
+                    field: None,
+                    note: None,
+                },
+                state,
+                now_secs,
+            );
             if !state.cfg.enforce.allow_added_tools && matches!(state.cfg.mode, Mode::Enforce) {
                 keep = false;
             }
         }
         if keep {
             kept.push(tool.clone());
+        } else {
+            stripped_any = true;
         }
     }
 
@@ -155,37 +219,43 @@ async fn response_filter(
         .collect();
     for pinned_name in pin.tools.keys() {
         if !runtime_names.contains(pinned_name.as_str()) && state.cfg.enforce.allow_removed_tools {
-            Event {
-                class: DetectionClass::RemovedTool,
-                severity: Severity::Info,
-                decision: Decision::Allowed,
-                asset_id: &state.cfg.exchange.asset_id,
-                asset_version: Some(&pin.asset_version),
-                tool_name: Some(pinned_name),
-                pin_hash: None,
-                runtime_hash: None,
-                field: None,
-                note: None,
-            }
-            .emit();
+            emit_debounced(
+                Event {
+                    class: DetectionClass::RemovedTool,
+                    severity: Severity::Info,
+                    decision: Decision::Allowed,
+                    asset_id: &state.cfg.exchange.asset_id,
+                    asset_version: Some(&pin.asset_version),
+                    tool_name: Some(pinned_name),
+                    pin_hash: None,
+                    runtime_hash: None,
+                    field: None,
+                    note: None,
+                },
+                state,
+                now_secs,
+            );
         }
     }
 
-    if matches!(state.cfg.mode, Mode::Enforce) {
-        let rewritten = rewrite_tools_list(&resp, kept);
-        // content-length already stripped on headers handler above.
-        let _ = body_state.handler().set_body(&rewritten);
+    if matches!(state.cfg.mode, Mode::Enforce) && stripped_any {
+        Some(rewrite_tools_list(resp, kept))
+    } else {
+        None
     }
 }
 
-fn rewrite_tools_list(resp: &jsonrpc::JsonRpcResponse, kept: Vec<serde_json::Value>) -> Vec<u8> {
+fn rewrite_tools_list(
+    resp: &jsonrpc::JsonRpcResponse,
+    kept: Vec<serde_json::Value>,
+) -> jsonrpc::JsonRpcResponse {
     let mut new_resp = resp.clone();
     let mut result = new_resp.result.unwrap_or_else(|| serde_json::json!({}));
     if let Some(map) = result.as_object_mut() {
         map.insert("tools".into(), serde_json::Value::Array(kept));
     }
     new_resp.result = Some(result);
-    serde_json::to_vec(&new_resp).expect("response serializes")
+    new_resp
 }
 
 #[entrypoint]
@@ -211,6 +281,7 @@ pub async fn configure(
     let state = PolicyState {
         cfg: Rc::new(cfg),
         pin: Rc::new(RefCell::new(None)),
+        debouncer: Rc::new(RefCell::new(Debouncer::default())),
     };
 
     // Pin refresh via HttpClient is injected per-filter once wired up;
