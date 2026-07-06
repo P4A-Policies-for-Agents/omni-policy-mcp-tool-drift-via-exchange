@@ -15,6 +15,24 @@ loopback workaround.
 
 ---
 
+## What this demo proves (at a glance)
+
+- **HAPPY** — every tool whose live descriptor matches the
+  Exchange-pinned descriptor passes through untouched. Here
+  `search_accounts` and `get_account_balance` match the pin exactly and
+  are returned as-is.
+- **FAILURE (enforce)** — a tool whose live `inputSchema` /
+  `description` has drifted from the pin is stripped from the
+  `tools/list` response. Here `lookup_account` drifts because the live
+  server adds `properties.accountId.description` (`"Account UUID"`) that
+  the pinned descriptor does not carry, so it is removed and a
+  `descriptor_drift` evidence event is emitted.
+
+The rest of this guide reproduces both paths end-to-end against the live
+demo route.
+
+---
+
 ## 0. Prerequisites
 
 - `anypoint-cli-v4` logged in to the target org/environment.

@@ -65,6 +65,36 @@ runtime:
 
 ---
 
+## How it works
+
+This is an **inbound MCP policy**. It pins the canonical tool
+descriptor set from an Anypoint Exchange asset (fetched via the two
+hops documented below — metadata → pre-signed S3) and compares every
+runtime JSON-RPC `tools/list` tool against that pin.
+
+The comparison is an **exact hash** over each descriptor's `name`,
+`description`, `inputSchema`, `outputSchema`, and `annotations`. From
+that compare the policy classifies each runtime tool as:
+
+- **DRIFT** — present in both the pin and the response, but the
+  canonical hash differs.
+- **UNPINNED** — present at runtime, absent from the pinned set.
+- **REMOVED** — present in the pin, absent at runtime.
+
+The `mode` setting decides what happens next:
+
+- `enforce` — strip the drifted tools from the response.
+- `warn` — pass them through with an `x-mcp-drift-warning` response
+  header.
+- `observe` — emit structured evidence only.
+
+This policy is **drift-only**: it detects divergence from the pinned
+contract and nothing more. It runs **no** prompt-injection heuristics
+and **no** near-name shadowing detection — those belong to the
+security-superset sibling described below.
+
+---
+
 ## What it catches
 
 - **Descriptor drift** — runtime descriptor hash ≠ published hash.
@@ -83,6 +113,45 @@ runtime:
 - `enforce` — strip drifted tools from `tools/list` responses.
 - `warn` — pass through with `x-mcp-drift-warning` header.
 - `observe` — emit structured evidence only.
+
+---
+
+## How this differs from `poisoning-detection-exchange`
+
+`poisoning-detection-exchange` and this policy are **not** the same
+thing, even though they share plumbing. Both pin from the **same**
+Exchange source via the same two-hop fetch (metadata → pre-signed S3),
+both detect descriptor drift, and both support `enforce` / `warn` /
+`observe` on top of a last-known-good cache.
+
+The difference is scope:
+
+- **`poisoning-detection-exchange` is the security superset.** On top
+  of drift detection it *additionally* runs **prompt-injection
+  heuristics** over descriptor text and **near-name shadowing**
+  detection (tools whose names impersonate a trusted tool).
+- **This policy is drift-only.** It stops at contract-divergence
+  detection — no injection heuristics, no shadowing.
+
+It also relates to the two A²D siblings. `drift-via-exchange` (this
+policy) is the **Exchange-sourced equivalent of `drift-via-a2d`'s cache
+mode**: it pins from a versioned Exchange asset instead of the A²D
+platform's `/mcp/spec` endpoint, and it drops the remote-PDP decision
+axis entirely (every decision is local). If your single source of truth
+is Exchange rather than the A²D platform, this is the drift policy to
+use.
+
+---
+
+## Real-world use case
+
+An enterprise whose API governance home is Anypoint Exchange publishes
+each MCP server's tool contract as a versioned Exchange asset. The
+gateway pins those descriptors and strips any production tool that has
+drifted from the published contract. The result is drift enforcement
+for teams whose single source of truth is Exchange — with no dependency
+on the A²D platform. Approving a contract change is the same act as
+bumping the Exchange asset version through the existing review workflow.
 
 ---
 
@@ -273,6 +342,33 @@ LC_ALL=C grep -a -c "exchangeFilePathPrefix" \
 LC_ALL=C grep -a -c "exchangePathPrefix" \
   target/wasm32-wasip1/release/omni_policy_mcp_tool_drift_via_exchange.wasm  # 0 == stale
 ```
+
+---
+
+## Spec caching & refresh
+
+The pinned descriptor set lives in an **in-memory, per-gateway-replica
+cache**. It is not shared across replicas and not persisted to disk —
+each replica loads and maintains its own copy.
+
+Refresh is **lazy / request-driven**, not a background timer:
+
+- On the first request with no pin loaded, the policy fetches the
+  descriptor set inline.
+- On subsequent requests it refetches once the cached pin's age reaches
+  `exchange.refreshIntervalSec` (default 300 s, min 30, max 86400).
+- Warming happens in the **request-headers** phase when the upstream
+  cluster is already known, otherwise in the **response** phase.
+
+On a **failed** refetch the **last-known-good** descriptor set is
+retained, so enforcement survives an Exchange outage.
+`failOpen.onPinUnavailable` only applies at **bootstrap** — when no
+descriptor set has ever loaded. Once any pin has loaded, a later fetch
+failure never downgrades the policy to fail-open; it keeps enforcing the
+last-known-good set.
+
+OAuth2 tokens are minted and refreshed as needed for the **metadata
+hop**; the pre-signed **S3 file hop** carries no `Authorization`.
 
 ---
 
