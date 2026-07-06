@@ -14,7 +14,7 @@ pub fn canonical_hash(tool: &serde_json::Value) -> String {
     let mut canon = serde_json::Map::new();
     for key in ["name", "description", "inputSchema", "outputSchema", "annotations"] {
         if let Some(v) = tool.get(key) {
-            canon.insert(key.to_string(), canonicalize(v));
+            canon.insert(key.to_string(), canonical_field(key, v));
         }
     }
     let bytes = serde_json::to_vec(&serde_json::Value::Object(canon))
@@ -38,6 +38,54 @@ fn canonicalize(v: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(a.iter().map(canonicalize).collect())
         }
         other => other.clone(),
+    }
+}
+
+/// JSON-Schema keys that carry no behavioral contract. Different schema
+/// serializers add or drop these freely (e.g. an MCP server that
+/// regenerates strict draft-07 schemas at runtime vs. the minimal copy
+/// stored at authoring time), so they are removed before hashing to stop
+/// cosmetic serialization differences from reading as tool drift.
+const SCHEMA_META_KEYS: &[&str] = &["$schema", "$id", "$comment"];
+
+/// Normalize a JSON Schema value for hashing:
+/// - drop metadata-only keys (`$schema`, `$id`, `$comment`),
+/// - fold the strict-default `additionalProperties: false` to "absent"
+///   so a serializer that emits it hashes the same as one that omits it.
+///
+/// Only provably cosmetic differences are folded. A real contract change
+/// — `type`/`properties`/`required`/`enum`/nested `description`, or
+/// loosening `additionalProperties` to `true`/a subschema — still changes
+/// the hash and is reported as drift.
+fn normalize_schema(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut out = serde_json::Map::new();
+            for (k, val) in m {
+                if SCHEMA_META_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
+                if k == "additionalProperties" && val.as_bool() == Some(false) {
+                    continue;
+                }
+                out.insert(k.clone(), normalize_schema(val));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(normalize_schema).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Canonicalize one top-level descriptor field. Schema-bearing fields are
+/// first run through `normalize_schema` so semantically-equal schemas
+/// hash identically regardless of serializer decoration.
+fn canonical_field(key: &str, v: &serde_json::Value) -> serde_json::Value {
+    match key {
+        "inputSchema" | "outputSchema" => canonicalize(&normalize_schema(v)),
+        _ => canonicalize(v),
     }
 }
 
@@ -120,9 +168,9 @@ pub fn classify(pin: &PinnedTool, runtime: &serde_json::Value) -> Option<DriftFi
         ("outputSchema", DriftField::OutputSchema),
         ("annotations", DriftField::Annotations),
     ] {
-        let a = pin.descriptor.get(key);
-        let b = runtime.get(key);
-        if a.map(canonicalize) != b.map(canonicalize) {
+        let a = pin.descriptor.get(key).map(|v| canonical_field(key, v));
+        let b = runtime.get(key).map(|v| canonical_field(key, v));
+        if a != b {
             return Some(field);
         }
     }
@@ -132,6 +180,25 @@ pub fn classify(pin: &PinnedTool, runtime: &serde_json::Value) -> Option<DriftFi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a runtime serializer that adds `$schema` +
+    /// `additionalProperties: false` must NOT read as drift against a pin
+    /// stored without those decorations.
+    #[test]
+    fn schema_serializer_decorations_do_not_drift() {
+        let pinned = serde_json::json!({
+            "name": "t", "description": "x",
+            "inputSchema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+        });
+        let runtime = serde_json::json!({
+            "name": "t", "description": "x",
+            "inputSchema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"],
+                "additionalProperties": false, "$schema": "http://json-schema.org/draft-07/schema#"}
+        });
+        assert_eq!(canonical_hash(&pinned), canonical_hash(&runtime));
+        let pin = PinnedTool::from_descriptor(pinned).unwrap();
+        assert_eq!(classify(&pin, &runtime), None);
+    }
 
     fn tool(name: &str, desc: &str) -> serde_json::Value {
         serde_json::json!({

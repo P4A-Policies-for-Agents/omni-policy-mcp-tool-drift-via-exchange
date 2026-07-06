@@ -1,0 +1,17 @@
+{
+  "exchange": {
+    "orgId": "82a0453b-22e6-430d-bbf4-35b989d043dc",
+    "groupId": "82a0453b-22e6-430d-bbf4-35b989d043dc",
+    "assetId": "mcp-pin-accounts",
+    "version": "1.0.0",
+    "baseUrl": "http://127.0.0.1:8081",
+    "exchangePathPrefix": "/exchange-pin",
+    "exchangeFilePathPrefix": "/exchange-s3",
+    "authType": "oauth2_client_credentials",
+    "credSecretRef": "REMOVED_EXCHANGE_CREDENTIAL",
+    "refreshIntervalSec": 300
+  },
+  "enforce": { "exactMatch": true, "allowAddedTools": false, "allowRemovedTools": true },
+  "mode": "enforce",
+  "failOpen": { "onPinUnavailable": true }
+}
