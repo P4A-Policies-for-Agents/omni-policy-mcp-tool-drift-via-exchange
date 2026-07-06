@@ -9,9 +9,10 @@ The demo mirrors the deployment pattern proven for the sibling A²D
 policy (see `DEPLOYMENT-NOTES.md`), including the managed-gateway
 loopback workaround.
 
-> The parent process publishes to Exchange (client id
-> `REMOVED_EXCHANGE_CLIENT_ID`). Do **not** publish or deploy from
-> this guide — the commands below are the reference recipe.
+> The parent process publishes to Exchange with a connected-app client id
+> (`<CLIENT_ID>`). Do **not** publish or deploy from
+> this guide — the commands below are the reference recipe. Supply your own
+> Exchange connected-app credentials; never commit real ones.
 
 ---
 
@@ -186,7 +187,7 @@ for the full create-and-deploy recipe.
     "exchangePathPrefix": "/exchange-pin",
     "exchangeFilePathPrefix": "/exchange-s3",
     "authType": "oauth2_client_credentials",
-    "credSecretRef": "REMOVED_EXCHANGE_CREDENTIAL",
+    "credSecretRef": "<CLIENT_ID>:<CLIENT_SECRET>",
     "refreshIntervalSec": 300
   },
   "enforce": { "exactMatch": true, "allowAddedTools": false, "allowRemovedTools": true },

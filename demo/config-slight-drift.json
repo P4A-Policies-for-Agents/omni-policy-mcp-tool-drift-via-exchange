@@ -8,7 +8,7 @@
     "exchangePathPrefix": "/exchange-pin",
     "exchangeFilePathPrefix": "/exchange-s3",
     "authType": "oauth2_client_credentials",
-    "credSecretRef": "REMOVED_EXCHANGE_CREDENTIAL",
+    "credSecretRef": "REPLACE_WITH_CLIENT_ID:REPLACE_WITH_CLIENT_SECRET",
     "refreshIntervalSec": 300
   },
   "enforce": { "exactMatch": true, "allowAddedTools": false, "allowRemovedTools": true },

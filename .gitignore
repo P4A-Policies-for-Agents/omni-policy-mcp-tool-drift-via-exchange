@@ -1,4 +1,9 @@
 target
+
+# Local demo configs holding real Exchange connected-app credentials.
+# Copy demo/config-*.json to demo/config-*.local.json and fill in creds.
+demo/*.local.json
+
 playground/config/custom-policies/*
 !playground/config/custom-policies/note.txt
 .pdk
