@@ -2,6 +2,20 @@
 
 Detects MCP tool drift by comparing runtime `tools/list` responses against canonical descriptors published to **Anypoint Exchange**. Built on PDK 1.9 (Rust → WebAssembly) for MuleSoft Flex Gateway / Omni Gateway.
 
+> [!IMPORTANT]
+> **⚠️ MANDATORY on a managed Omni Gateway — Exchange + pre-signed S3 are `Host`-strict.**
+>
+> This policy calls Anypoint Exchange and follows its redirect to a pre-signed storage (S3) URL. Both are `Host`-strict: routing and the URL signature depend on the exact `Host` / TLS SNI — exactly like the multi-tenant edge platforms **Vercel, Railway, Render, Heroku, Cloudflare Pages/Workers, Fly.io, Netlify**. On a **managed** Omni Gateway (e.g. Anypoint CloudHub 2.0), policy-originated (WASM) outbound calls have their egress `Host` rewritten to an internal Envoy cluster name, so Exchange returns `404`/`403` and the S3 signature fails.
+>
+> **You MUST route BOTH hops through same-gateway loopback "pins":**
+> 1. Set **`exchange.baseUrl`** = `http://127.0.0.1:8081` (the gateway's own internal listener).
+> 2. Set **`exchange.exchangePathPrefix`** = `/exchange-pin` (hop 1: Exchange API) and **`exchange.exchangeFilePathPrefix`** = `/exchange-s3` (hop 2: the pre-signed S3 descriptor).
+> 3. Create two plain passthrough routes (no policy) on the **same** gateway — `/exchange-pin` → `https://anypoint.mulesoft.com`, and `/exchange-s3` → the S3 asset host — each with **`auto_host_rewrite`** so the correct `Host` is restored on egress.
+>
+> Without the pins the policy **cannot reach Exchange/S3** on a managed gateway. Full recipe: [`docs/managed-omni-gateway-setup.md`](docs/managed-omni-gateway-setup.md). The same pin applies to any custom upstream you self-host on one of the edge platforms listed above.
+>
+> **Self-managed / connected Flex Gateway** (reaches both hosts directly and honors route `auto_host_rewrite`): leave both prefixes empty for direct calls.
+
 After the policy is applied, every `tools/list` response is validated against the descriptor set stored in an Exchange MCP asset. Drifted tools can be stripped, annotated with warnings, or logged for observability — depending on the configured enforcement mode.
 
 ## Apply this policy to an MCP-typed API instance

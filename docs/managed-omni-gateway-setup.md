@@ -5,6 +5,8 @@ policy on a **managed** Anypoint Flex / Omni Gateway (CloudHub 2.0), and
 the one non-obvious piece of infrastructure it needs there: the
 **Exchange pin-fetch loopback routes** — note the plural.
 
+The same `Host`-mangling failure — and the same loopback-pin fix — applies to **any** `Host`-routed multi-tenant edge platform: Vercel, Railway, Render, Heroku, Cloudflare Pages/Workers, Fly.io, Netlify.
+
 If you run a self-managed (connected) Flex Gateway whose pod can reach
 both `anypoint.mulesoft.com` **and** the Exchange pre-signed storage host
 directly with the correct `Host`, you do **not** need the loopbacks — set
